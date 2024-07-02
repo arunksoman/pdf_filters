@@ -3,7 +3,7 @@ from libc.stdint cimport uint8_t, uint32_t
 from cpython cimport array
 import array
 from pdfexceptions import PDFException, PDFValueError
-
+from typing import Optional
 ctypedef fused IntOrStr:
     int
     str
@@ -329,9 +329,18 @@ cdef class CCITTG4Parser(BitParser):
         self.bytealign = bytealign
         self.reset()
 
-    cdef public void feedbytes(self):
+    cdef public void feedbytes(self, bytes data):
         cdef uint8_t byte
         cdef int m
+        for byte in data:
+            try:
+                for m in (128, 64, 32, 16, 8, 4, 2, 1):
+                    self._parse_bit(byte & m)
+            except self.ByteSkip:
+                self._accept = self._parse_mode
+                self._state = self.MODE
+            except self.EOFB:
+                break
 
 
     cdef public void reset(self):
@@ -358,3 +367,206 @@ cdef class CCITTG4Parser(BitParser):
             if self.bytealign:
                 raise self.ByteSkip
     
+    cdef _parse_mode(self, object mode):
+        if mode == "p":
+            self._do_pass()
+            self._flush_line()
+            return self.MODE
+        elif mode == "h":
+            self._n1 = 0
+            self._accept = self._parse_horiz1
+            if self._color:
+                return self.WHITE
+            else:
+                return self.BLACK
+        elif mode == "u":
+            self._accept = self._parse_uncompressed
+            return self.UNCOMPRESSED
+        elif mode == "e":
+            raise self.EOFB
+        elif isinstance(mode, int):
+            self._do_vertical(mode)
+            self._flush_line()
+            return self.MODE
+        else:
+            raise self.InvalidData(mode)
+    
+    cdef _parse_horiz1(self, n: Optional[int]):
+        if n is None:
+            raise self.InvalidData
+        self._n1 += n
+        if n < 64:
+            self._n2 = 0
+            self._color = 1 - self._color
+            self._accept = self._parse_horiz2
+        if self._color:
+            return self.WHITE
+        else:
+            return self.BLACK
+    
+    cdef _parse_horiz2(self, n: Optional[int]):
+        if n is None:
+            raise self.InvalidData
+        self._n2 += n
+        if n < 64:
+            self._color = 1 - self._color
+            self._accept = self._parse_mode
+            self._do_horizontal(self._n1, self._n2)
+            self._flush_line()
+            return self.MODE
+        elif self._color:
+            return self.WHITE
+        else:
+            return self.BLACK
+    
+    cdef _parse_uncompressed(self, bits: Optional[str]):
+        if not bits:
+            raise self.InvalidData
+        if bits.startswith("T"):
+            self._accept = self._parse_mode
+            self._color = int(bits[1])
+            self._do_uncompressed(bits[2:])
+            return self.MODE
+        else:
+            self._do_uncompressed(bits)
+            return self.UNCOMPRESSED
+    
+    cdef _get_bits(self):
+        return "".join(str(b) for b in self._curline[: self._curpos])
+    
+    cdef _get_refline(self, int i):
+        if i < 0:
+            return "[]" + "".join(str(b) for b in self._refline)
+        elif len(self._refline) <= i:
+            return "".join(str(b) for b in self._refline) + "[]"
+        else:
+            return (
+                "".join(str(b) for b in self._refline[:i])
+                + "["
+                + str(self._refline[i])
+                + "]"
+                + "".join(str(b) for b in self._refline[i + 1 :])
+            )
+    
+    cdef public void _do_vertical(self, int dx):
+        cdef int x1, x0
+
+        x1 = self._curpos + 1
+        while 1:
+            if x1 == 0:
+                if self._color == 1 and self._refline[x1] != self._color:
+                    break
+            elif x1 == len(self._refline):
+                break
+            elif (
+                self._refline[x1 - 1] == self._color
+                and self._refline[x1] != self._color
+            ):
+                break
+            x1 += 1
+        x1 += dx
+        x0 = max(0, self._curpos)
+        x1 = max(0, min(self.width, x1))
+        if x1 < x0:
+            for x in range(x1, x0):
+                self._curline[x] = self._color
+        elif x0 < x1:
+            for x in range(x0, x1):
+                self._curline[x] = self._color
+        self._curpos = x1
+        self._color = 1 - self._color
+    
+    cdef public void _do_pass(self):
+        cdef int x1
+        x1 = self._curpos + 1
+        while 1:
+            if x1 == 0:
+                if self._color == 1 and self._refline[x1] != self._color:
+                    break
+            elif x1 == len(self._refline):
+                break
+            elif (
+                self._refline[x1 - 1] == self._color
+                and self._refline[x1] != self._color
+            ):
+                break
+            x1 += 1
+        while 1:
+            if x1 == 0:
+                if self._color == 0 and self._refline[x1] == self._color:
+                    break
+            elif x1 == len(self._refline):
+                break
+            elif (
+                self._refline[x1 - 1] != self._color
+                and self._refline[x1] == self._color
+            ):
+                break
+            x1 += 1
+        for x in range(self._curpos, x1):
+            self._curline[x] = self._color
+        self._curpos = x1
+
+    cdef public void _do_horizontal(self, int n1,  int n2):
+        cdef int x
+        if self._curpos < 0:
+            self._curpos = 0
+        x = self._curpos
+        for _ in range(n1):
+            if len(self._curline) <= x:
+                break
+            self._curline[x] = self._color
+            x += 1
+        for _ in range(n2):
+            if len(self._curline) <= x:
+                break
+            self._curline[x] = 1 - self._color
+            x += 1
+        self._curpos = x
+
+    cdef public void _do_uncompressed(self, str bits):
+        cdef uint8_t c
+        for c in bits:
+            self._curline[self._curpos] = int(c)
+            self._curpos += 1
+            self._flush_line()
+
+
+cdef class CCITTFaxDecoder(CCITTG4Parser):
+    cdef public bint reversed
+    cdef bytes _buf
+
+    def __init__(self, int width, bint bytealign=False, bint reversed=False):
+        CCITTG4Parser.__init__(self, width, bytealign=bytealign)
+        self.reversed = reversed
+        self._buf = b""
+
+    def close(self):
+        return self._buf
+
+    def output_line(self, int y, array.array bits):
+        cdef array.array arr = array.array('B', [0] * ((len(bits) + 7) // 8))
+        cdef int i, b
+        if self.reversed:
+            bits = array.array('b', [1 - b for b in bits])
+        for i, b in enumerate(bits):
+            if b:
+                arr[i // 8] += (128, 64, 32, 16, 8, 4, 2, 1)[i % 8]
+        self._buf += arr.tobytes()
+
+def ccittfaxdecode(bytes data, dict params):
+    cdef int K = params.get("K", 0)
+    cdef int cols
+    cdef bint bytealign, reversed
+    cdef CCITTFaxDecoder parser
+    
+    if K == -1:
+        cols = params.get("Columns", 0)
+        bytealign = params.get("EncodedByteAlign", False)
+        reversed = params.get("BlackIs1", False)
+        parser = CCITTFaxDecoder(cols, bytealign=bytealign, reversed=reversed)
+    else:
+        raise ValueError(f"Unsupported K value: {K}")
+    
+    parser.feedbytes(data)
+    return parser.close()
