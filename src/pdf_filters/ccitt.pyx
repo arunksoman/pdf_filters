@@ -566,7 +566,7 @@ def ccittfaxdecode(bytes data, dict params):
         reversed = params.get("BlackIs1", False)
         parser = CCITTFaxDecoder(cols, bytealign=bytealign, reversed=reversed)
     else:
-        raise ValueError(f"Unsupported K value: {K}")
+        raise PDFValueError(K)
     
     parser.feedbytes(data)
     return parser.close()
